@@ -1,0 +1,107 @@
+name: Build and Deploy to VM 
+
+on:
+  push:
+    branches:
+      - test_app
+
+env:
+  PROJECT_ID: ia-generation-5
+  GAR_LOCATION: europe-west9-docker.pkg.dev
+  runs-on: ubuntu-latest
+  environment: api-test
+  REPOSITORY: futurandco
+  IMAGE: api-test
+
+jobs:
+  setup-build-test-publish-deploy:
+    name: Setup, Build, Test, Publish, and Deploy 
+    runs-on: ubuntu-latest
+    environment: test
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v2
+        with:
+          python-version: '3.8'
+
+      - name: Install the gcloud cli 
+        uses: google-github-actions/setup-gcloud@v0
+        with:
+          project_id: ${{ env.PROJECT_ID }}
+          service_account_key: ${{ secrets.GCP_CREDENTIALS }}
+          install_components: 'gke-gcloud-auth-plugin'
+          export_default_credentails: true
+
+      - name: Configure Docker for Google Artifact Registry
+        run: |
+          gcloud auth configure-docker ${{ env.GAR_LOCATION }}
+
+      - name: Build Docker image
+        working-directory: app
+        run: |
+          docker build \
+            --tag "$GAR_LOCATION/$PROJECT_ID/$REPOSITORY/$IMAGE:$GITHUB_SHA" \
+            --build-arg GITHUB_SHA="$GITHUB_SHA" .
+
+    #  - name: Run Docker image for testing
+    #    working-directory: app
+    #    run: |
+    #      docker run -d --name test-container -p 8000:8000 "$GAR_LOCATION/$PROJECT_ID/$REPOSITORY/$IMAGE:$GITHUB_SHA"
+      
+      #- name: Test Docker container
+      #  working-directory: app
+      #  run: |
+          # Insert your specific test commands here, for example:
+      #    curl --fail http://localhost:8000/docs
+
+      #- name: Stop and remove Docker container
+      #  working-directory: app
+      #  run: |
+      #    docker stop test-container
+      #    docker rm test-container
+
+      #- name: Push Docker image to Artifact Registry
+      #  if: success()
+      #  working-directory: app
+      #  run: |
+      #    docker push "$GAR_LOCATION/$PROJECT_ID/$REPOSITORY/$IMAGE:$GITHUB_SHA"
+      - name: Push Docker image to Artifact Registry
+        working-directory: app
+        run: |
+          docker push "$GAR_LOCATION/$PROJECT_ID/$REPOSITORY/$IMAGE:$GITHUB_SHA"
+    #      #docker push "europe-west9-docker.pkg.dev/ia-generation-5/futurandco/api-test:$GITHUB_SHA"
+
+      - name: Deploy to VM
+        if: success()
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          VM_IP: ${{ secrets.VM_IP }}
+          SSH_USERNAME: ${{ secrets.SSH_USERNAME }}
+        run: |
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" | base64 --decode > /tmp/ssh_private_key
+          chmod 600 /tmp/ssh_private_key
+          ssh -o StrictHostKeyChecking=no -i /tmp/ssh_private_key goli_sateesh@34.173.250.195 << 'EOF'
+            # Configuring SSH for GitHub
+            docker-compose down
+            docker rmi $(docker images -q)
+            rm docker-compose.yaml
+            IMAGE_FASTAPI_TEST_TAG=$(gcloud container images list-tags europe-west9-docker.pkg.dev/ia-generation-5/futurandco/api-test --format='value(tags[0])' --sort-by=TIMESTAMP | tail -n 1)
+            IMAGE_SEARCH_TEST_TAG=$(gcloud container images list-tags europe-west9-docker.pkg.dev/ia-generation-5/futurandco/lancedb-test --format='value(tags[0])' --sort-by=TIMESTAMP | tail -n 1)
+            IMAGE_MODEL_TEST_TAG=$(gcloud container images list-tags europe-west9-docker.pkg.dev/ia-generation-5/futurandco/model-test --format='value(tags[0])' --sort-by=TIMESTAMP | tail -n 1)
+            docker pull europe-west9-docker.pkg.dev/ia-generation-5/futurandco/api-test:$IMAGE_TAG
+            docker run -d --name temp-container -e ACCESS_TOKEN_EXPIRE_MINUTES="30" -e ACCESS_TOKEN_EXPIRE_DAYS="7" -e REFRESH_TOKEN_EXPIRE_DAYS="30" -p 8001:8000 europe-west9-docker.pkg.dev/ia-generation-5/futurandco/api-test:$IMAGE_FASTAPI_TEST_TAG
+            docker cp temp-container:app/docker-compose.yaml ./docker-compose.yaml
+
+            #Update the docker-compose file 
+            sed -i 's|${IMAGE_FASTAPI_TEST_TAG}|'"$IMAGE_FASTAPI_TEST_TAG"'|g' docker-compose.yaml 
+            sed -i 's|${IMAGE_SEARCH_TEST_TAG}|'"$IMAGE_SEARCH_TEST_TAG"'|g' docker-compose.yaml
+            sed -i 's|${IMAGE_MODEL_TEST_TAG}|'"$IMAGE_MODEL_TEST_TAG"'|g' docker-compose.yaml
+
+            docker stop temp-container
+            docker rm temp-container
+            docker-compose up -d
+          EOF
